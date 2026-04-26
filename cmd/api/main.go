@@ -11,9 +11,11 @@ import (
 
 	"github.com/DavitHakobyan/shipper-to-carrier/internal/app"
 	"github.com/DavitHakobyan/shipper-to-carrier/internal/carrieridentity"
+	"github.com/DavitHakobyan/shipper-to-carrier/internal/externalevidence"
 	"github.com/DavitHakobyan/shipper-to-carrier/internal/identity"
 	"github.com/DavitHakobyan/shipper-to-carrier/internal/platform/config"
 	"github.com/DavitHakobyan/shipper-to-carrier/internal/platform/store/postgres"
+	"github.com/DavitHakobyan/shipper-to-carrier/internal/trust"
 )
 
 func main() {
@@ -39,8 +41,12 @@ func main() {
 	authenticator := identity.NewService(repo, cfg.SessionTTL)
 	carrierRepo := carrieridentity.NewPostgresRepository(pool)
 	carrierService := carrieridentity.NewService(carrierRepo)
+	evidenceRepo := externalevidence.NewPostgresRepository(pool)
+	evidenceService := externalevidence.NewService(evidenceRepo, externalevidence.NewMockProvider())
+	trustRepo := trust.NewPostgresRepository(pool)
+	trustService := trust.NewService(trustRepo)
 
-	handler, err := app.NewServer(cfg, authenticator, carrierService)
+	handler, err := app.NewServer(cfg, authenticator, carrierService, evidenceService, trustService)
 	if err != nil {
 		log.Fatalf("build server: %v", err)
 	}

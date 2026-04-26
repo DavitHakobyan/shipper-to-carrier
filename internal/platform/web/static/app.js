@@ -2,6 +2,7 @@ const state = {
   account: null,
   appName: 'Shipper to Carrier',
   onboarding: null,
+  intelligence: null,
 };
 
 async function request(path, options = {}) {
@@ -39,9 +40,11 @@ async function bootstrap() {
     state.account = response.account;
     routeToRole(state.account.role);
     await hydrateOnboarding();
+    await hydrateIntelligence();
   } catch (_error) {
     state.account = null;
     state.onboarding = null;
+    state.intelligence = null;
   }
 
   render();
@@ -57,6 +60,19 @@ async function hydrateOnboarding() {
     state.onboarding = await request('/api/v1/carriers/current/onboarding-status', { method: 'GET' });
   } catch (_error) {
     state.onboarding = null;
+  }
+}
+
+async function hydrateIntelligence() {
+  if (!state.account || state.account.role !== 'carrier') {
+    state.intelligence = null;
+    return;
+  }
+
+  try {
+    state.intelligence = await request('/api/v1/carriers/current/intelligence', { method: 'GET' });
+  } catch (_error) {
+    state.intelligence = null;
   }
 }
 
@@ -87,7 +103,7 @@ function render() {
   const route = activeRoute() || state.account.role;
   const heading = route === 'carrier' ? 'Carrier dashboard' : 'Shipper dashboard';
   const routeLabel = route === 'carrier'
-    ? 'Carrier onboarding captures company identity, owners, authority, and insurance before scoring starts.'
+    ? 'Carrier onboarding now drives FMCSA evidence refresh, basic scorecards, fraud signals, and progressive access grants.'
     : 'Shipper account setup and load posting foundations start here.';
 
   root.innerHTML = `
@@ -117,11 +133,12 @@ function render() {
             <a href="#/carrier" class="${route === 'carrier' ? 'active' : ''}">Carrier shell</a>
             <a href="#/shipper" class="${route === 'shipper' ? 'active' : ''}">Shipper shell</a>
           </nav>
-          <p class="small">Milestone 2 adds carrier onboarding and verification workflow state. Shipper-specific flows remain for a later milestone.</p>
+          <p class="small">Milestone 3 adds FMCSA evidence and trust scoring. Shipper-specific flows remain for a later milestone.</p>
         </article>
       </div>
 
       <p id="message" class="message"></p>
+      ${route === 'carrier' && state.account.role === 'carrier' ? renderCarrierIntelligence() : ''}
       ${route === 'carrier' && state.account.role === 'carrier' ? renderCarrierOnboarding() : renderPlaceholder(route)}
     </section>
   `;
@@ -174,6 +191,71 @@ function renderPlaceholder(route) {
   `;
 }
 
+function renderCarrierIntelligence() {
+  if (!state.onboarding) {
+    return '';
+  }
+
+  if (!state.intelligence) {
+    return `
+      <section class="card">
+        <div class="panel-header">
+          <div>
+            <h3>Carrier intelligence</h3>
+            <p class="small">Link authority and refresh FMCSA to generate the first scorecard.</p>
+          </div>
+          <button id="refresh-fmcsa-button" class="secondary">Refresh FMCSA</button>
+        </div>
+      </section>
+    `;
+  }
+
+  const grants = state.intelligence.scorecard.accessGrants.length === 0
+    ? '<p class="small">No active access grants.</p>'
+    : `<ul>${state.intelligence.scorecard.accessGrants.map((grant) => `<li>${grant.grantType}: ${grant.grantValue}</li>`).join('')}</ul>`;
+  const signals = state.intelligence.scorecard.fraudSignals.length === 0
+    ? '<p class="small">No active fraud signals.</p>'
+    : `<ul>${state.intelligence.scorecard.fraudSignals.map((signal) => `<li>${signal.signalType} (${signal.severity})</li>`).join('')}</ul>`;
+
+  return `
+    <section class="grid two">
+      <article class="card">
+        <div class="panel-header">
+          <div>
+            <h3>FMCSA evidence</h3>
+            <p class="small">Latest refresh: ${new Date(state.intelligence.fmcsa.fetchedAt).toLocaleString()}</p>
+          </div>
+          <button id="refresh-fmcsa-button" class="secondary">Refresh FMCSA</button>
+        </div>
+        <dl>
+          <div><dt>Status</dt><dd>${state.intelligence.fmcsa.status}</dd></div>
+          <div><dt>Source key</dt><dd>${state.intelligence.fmcsa.sourceKey}</dd></div>
+          <div><dt>Legal name</dt><dd>${state.intelligence.fmcsa.legalName}</dd></div>
+          <div><dt>Authority</dt><dd>${state.intelligence.fmcsa.authorityStatus}</dd></div>
+          <div><dt>Operating status</dt><dd>${state.intelligence.fmcsa.operatingStatus}</dd></div>
+          <div><dt>Safety rating</dt><dd>${state.intelligence.fmcsa.safetyRating}</dd></div>
+          <div><dt>Crashes</dt><dd>${state.intelligence.fmcsa.crashCount}</dd></div>
+        </dl>
+      </article>
+
+      <article class="card">
+        <h3>Scorecard outcome</h3>
+        <dl>
+          <div><dt>Score</dt><dd>${state.intelligence.scorecard.scoreValue}</dd></div>
+          <div><dt>Score band</dt><dd>${state.intelligence.scorecard.scoreBand}</dd></div>
+          <div><dt>Eligibility tier</dt><dd>${state.intelligence.scorecard.eligibilityTier}</dd></div>
+          <div><dt>Verification completeness</dt><dd>${Math.round(state.intelligence.scorecard.verificationCompleteness * 100)}%</dd></div>
+        </dl>
+        <p class="small">${state.intelligence.scorecard.reasonSummary}</p>
+        <h4>Access grants</h4>
+        ${grants}
+        <h4>Fraud signals</h4>
+        ${signals}
+      </article>
+    </section>
+  `;
+}
+
 function renderCarrierOnboarding() {
   if (!state.onboarding) {
     return `
@@ -203,6 +285,7 @@ function renderCarrierOnboarding() {
             <li>Authority linked</li>
             <li>Insurance submitted</li>
             <li>Review pending</li>
+            <li>FMCSA matched and tier assigned</li>
           </ol>
         </article>
       </section>
@@ -254,9 +337,9 @@ function renderCarrierOnboarding() {
         <h3>Link authority</h3>
         <label>DOT number<input name="dotNumber"></label>
         <label>MC number<input name="mcNumber"></label>
-        <label>USDOT status<input name="usdotStatus" value="pending"></label>
+        <label>USDOT status<input name="usdotStatus" value="active"></label>
         <label>Authority type<input name="authorityType" value="for_hire"></label>
-        <button type="submit">Save authority</button>
+        <button type="submit">Save authority and refresh FMCSA</button>
       </form>
 
       <form id="insurance-form" class="card">
@@ -293,6 +376,11 @@ function bindCarrierForms() {
   if (insuranceForm) {
     insuranceForm.addEventListener('submit', handleInsurance);
   }
+
+  const refreshButton = document.querySelector('#refresh-fmcsa-button');
+  if (refreshButton) {
+    refreshButton.addEventListener('click', handleFMCSARefresh);
+  }
 }
 
 async function handleRegister(event) {
@@ -313,6 +401,7 @@ async function handleRegister(event) {
     state.account = response.account;
     routeToRole(state.account.role);
     await hydrateOnboarding();
+    await hydrateIntelligence();
     render();
   } catch (error) {
     setMessage(error.message);
@@ -335,6 +424,7 @@ async function handleLogin(event) {
     state.account = response.account;
     routeToRole(state.account.role);
     await hydrateOnboarding();
+    await hydrateIntelligence();
     render();
   } catch (error) {
     setMessage(error.message);
@@ -366,6 +456,7 @@ async function handleCreateCarrier(event) {
         },
       }),
     });
+    await hydrateIntelligence();
     render();
   } catch (error) {
     setMessage(error.message);
@@ -387,6 +478,7 @@ async function handleOwner(event) {
         isPrimaryContact: form.get('isPrimaryContact') === 'on',
       }),
     });
+    await hydrateIntelligence();
     render();
   } catch (error) {
     setMessage(error.message);
@@ -407,6 +499,7 @@ async function handleAuthority(event) {
         authorityType: form.get('authorityType'),
       }),
     });
+    await hydrateIntelligence();
     render();
   } catch (error) {
     setMessage(error.message);
@@ -429,6 +522,16 @@ async function handleInsurance(event) {
         verificationStatus: form.get('verificationStatus'),
       }),
     });
+    await hydrateIntelligence();
+    render();
+  } catch (error) {
+    setMessage(error.message);
+  }
+}
+
+async function handleFMCSARefresh() {
+  try {
+    state.intelligence = await request('/api/v1/carriers/current/fmcsa-refresh', { method: 'POST' });
     render();
   } catch (error) {
     setMessage(error.message);
@@ -439,6 +542,7 @@ async function handleLogout() {
   await request('/api/v1/sessions/logout', { method: 'POST' });
   state.account = null;
   state.onboarding = null;
+  state.intelligence = null;
   window.location.hash = '';
   render();
 }

@@ -8,9 +8,11 @@ import (
 	"time"
 
 	"github.com/DavitHakobyan/shipper-to-carrier/internal/carrieridentity"
+	"github.com/DavitHakobyan/shipper-to-carrier/internal/externalevidence"
 	platformauth "github.com/DavitHakobyan/shipper-to-carrier/internal/platform/auth"
 	"github.com/DavitHakobyan/shipper-to-carrier/internal/platform/config"
 	"github.com/DavitHakobyan/shipper-to-carrier/internal/platform/web"
+	"github.com/DavitHakobyan/shipper-to-carrier/internal/trust"
 	"github.com/DavitHakobyan/shipper-to-carrier/internal/verification"
 
 	"github.com/DavitHakobyan/shipper-to-carrier/internal/identity"
@@ -32,10 +34,22 @@ type CarrierOnboarder interface {
 	GetCurrentOnboardingStatus(ctx context.Context, actor identity.AuthenticatedAccount) (carrieridentity.OnboardingStatus, error)
 }
 
+type EvidenceService interface {
+	RefreshFMCSA(ctx context.Context, status carrieridentity.OnboardingStatus) (externalevidence.FMCSAData, error)
+	LatestFMCSA(ctx context.Context, carrierAccountID string) (externalevidence.FMCSAData, error)
+}
+
+type TrustService interface {
+	Evaluate(ctx context.Context, onboarding carrieridentity.OnboardingStatus, fmcsa externalevidence.FMCSAData) (trust.TrustStatus, error)
+	LatestTrust(ctx context.Context, carrierAccountID string) (trust.TrustStatus, error)
+}
+
 type Server struct {
 	config           config.Config
 	authenticator    Authenticator
 	carrierOnboarder CarrierOnboarder
+	evidenceService  EvidenceService
+	trustService     TrustService
 }
 
 type configResponse struct {
@@ -189,7 +203,48 @@ type verificationRequirementResponse struct {
 	SatisfiedAt     *time.Time                     `json:"satisfiedAt,omitempty"`
 }
 
-func NewServer(cfg config.Config, authenticator Authenticator, carrierOnboarder CarrierOnboarder) (http.Handler, error) {
+type intelligenceResponse struct {
+	FMCSA     fmcsaResponse     `json:"fmcsa"`
+	Scorecard scorecardResponse `json:"scorecard"`
+}
+
+type fmcsaResponse struct {
+	Status          externalevidence.SnapshotStatus `json:"status"`
+	FetchedAt       time.Time                       `json:"fetchedAt"`
+	SourceKey       string                          `json:"sourceKey"`
+	LegalName       string                          `json:"legalName"`
+	AuthorityStatus string                          `json:"authorityStatus"`
+	OperatingStatus string                          `json:"operatingStatus"`
+	OutOfService    bool                            `json:"outOfService"`
+	SafetyRating    string                          `json:"safetyRating"`
+	CrashCount      int                             `json:"crashCount"`
+	InspectionCount int                             `json:"inspectionCount"`
+	OOSRate         float64                         `json:"oosRate"`
+}
+
+type scorecardResponse struct {
+	ScoreValue               int                   `json:"scoreValue"`
+	ScoreBand                trust.ScoreBand       `json:"scoreBand"`
+	EligibilityTier          trust.EligibilityTier `json:"eligibilityTier"`
+	VerificationCompleteness float64               `json:"verificationCompleteness"`
+	ReasonSummary            string                `json:"reasonSummary"`
+	GeneratedAt              time.Time             `json:"generatedAt"`
+	AccessGrants             []accessGrantResponse `json:"accessGrants"`
+	FraudSignals             []fraudSignalResponse `json:"fraudSignals"`
+}
+
+type accessGrantResponse struct {
+	GrantType  string `json:"grantType"`
+	GrantValue string `json:"grantValue"`
+}
+
+type fraudSignalResponse struct {
+	SignalType string                  `json:"signalType"`
+	Severity   trust.FraudSeverity     `json:"severity"`
+	Status     trust.FraudSignalStatus `json:"status"`
+}
+
+func NewServer(cfg config.Config, authenticator Authenticator, carrierOnboarder CarrierOnboarder, evidenceService EvidenceService, trustService TrustService) (http.Handler, error) {
 	assetHandler, err := web.NewHandler()
 	if err != nil {
 		return nil, err
@@ -199,6 +254,8 @@ func NewServer(cfg config.Config, authenticator Authenticator, carrierOnboarder 
 		config:           cfg,
 		authenticator:    authenticator,
 		carrierOnboarder: carrierOnboarder,
+		evidenceService:  evidenceService,
+		trustService:     trustService,
 	}
 
 	mux := http.NewServeMux()
@@ -213,6 +270,8 @@ func NewServer(cfg config.Config, authenticator Authenticator, carrierOnboarder 
 	mux.HandleFunc("POST /api/v1/carriers/{carrierID}/authority", server.handleUpsertAuthority)
 	mux.HandleFunc("POST /api/v1/carriers/{carrierID}/insurance", server.handleAddInsurance)
 	mux.HandleFunc("GET /api/v1/carriers/{carrierID}/onboarding-status", server.handleOnboardingStatus)
+	mux.HandleFunc("POST /api/v1/carriers/{carrierID}/fmcsa-refresh", server.handleFMCSARefresh)
+	mux.HandleFunc("GET /api/v1/carriers/{carrierID}/intelligence", server.handleIntelligence)
 	mux.Handle("/", assetHandler)
 
 	return mux, nil
@@ -356,7 +415,13 @@ func (s *Server) handleAddOwner(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	status, err := s.carrierOnboarder.AddOwner(r.Context(), actor, r.PathValue("carrierID"), carrieridentity.AddOwnerInput{
+	carrierID, err := s.resolveCarrierID(r.Context(), actor, r.PathValue("carrierID"))
+	if err != nil {
+		writeJSON(w, statusForError(err), errorResponse{Error: err.Error()})
+		return
+	}
+
+	status, err := s.carrierOnboarder.AddOwner(r.Context(), actor, carrierID, carrieridentity.AddOwnerInput{
 		FullName:         input.FullName,
 		Phone:            input.Phone,
 		Email:            input.Email,
@@ -384,7 +449,13 @@ func (s *Server) handleUpsertAuthority(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	status, err := s.carrierOnboarder.UpsertAuthority(r.Context(), actor, r.PathValue("carrierID"), carrieridentity.UpsertAuthorityInput{
+	carrierID, err := s.resolveCarrierID(r.Context(), actor, r.PathValue("carrierID"))
+	if err != nil {
+		writeJSON(w, statusForError(err), errorResponse{Error: err.Error()})
+		return
+	}
+
+	status, err := s.carrierOnboarder.UpsertAuthority(r.Context(), actor, carrierID, carrieridentity.UpsertAuthorityInput{
 		DOTNumber:     input.DOTNumber,
 		MCNumber:      input.MCNumber,
 		USDOTStatus:   input.USDOTStatus,
@@ -395,6 +466,7 @@ func (s *Server) handleUpsertAuthority(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	_, _ = s.syncCarrierIntelligence(r.Context(), actor, status)
 	writeJSON(w, http.StatusOK, onboardingStatusFromDomain(status))
 }
 
@@ -411,7 +483,13 @@ func (s *Server) handleAddInsurance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	status, err := s.carrierOnboarder.AddInsurance(r.Context(), actor, r.PathValue("carrierID"), carrieridentity.AddInsuranceInput{
+	carrierID, err := s.resolveCarrierID(r.Context(), actor, r.PathValue("carrierID"))
+	if err != nil {
+		writeJSON(w, statusForError(err), errorResponse{Error: err.Error()})
+		return
+	}
+
+	status, err := s.carrierOnboarder.AddInsurance(r.Context(), actor, carrierID, carrieridentity.AddInsuranceInput{
 		ProviderName:       input.ProviderName,
 		PolicyNumber:       input.PolicyNumber,
 		CoverageType:       input.CoverageType,
@@ -420,6 +498,11 @@ func (s *Server) handleAddInsurance(w http.ResponseWriter, r *http.Request) {
 		VerificationStatus: input.VerificationStatus,
 	})
 	if err != nil {
+		writeJSON(w, statusForError(err), errorResponse{Error: err.Error()})
+		return
+	}
+
+	if _, err := s.tryEvaluateLatest(r.Context(), status); err != nil && !errors.Is(err, externalevidence.ErrNoSnapshot) {
 		writeJSON(w, statusForError(err), errorResponse{Error: err.Error()})
 		return
 	}
@@ -447,6 +530,68 @@ func (s *Server) handleOnboardingStatus(w http.ResponseWriter, r *http.Request) 
 	}
 
 	writeJSON(w, http.StatusOK, onboardingStatusFromDomain(status))
+}
+
+func (s *Server) handleFMCSARefresh(w http.ResponseWriter, r *http.Request) {
+	actor, err := s.authenticatedActor(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, errorResponse{Error: err.Error()})
+		return
+	}
+
+	carrierID, err := s.resolveCarrierID(r.Context(), actor, r.PathValue("carrierID"))
+	if err != nil {
+		writeJSON(w, statusForError(err), errorResponse{Error: err.Error()})
+		return
+	}
+
+	status, err := s.carrierOnboarder.GetOnboardingStatus(r.Context(), actor, carrierID)
+	if err != nil {
+		writeJSON(w, statusForError(err), errorResponse{Error: err.Error()})
+		return
+	}
+
+	response, err := s.syncCarrierIntelligence(r.Context(), actor, status)
+	if err != nil {
+		writeJSON(w, statusForError(err), errorResponse{Error: err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, response)
+}
+
+func (s *Server) handleIntelligence(w http.ResponseWriter, r *http.Request) {
+	actor, err := s.authenticatedActor(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, errorResponse{Error: err.Error()})
+		return
+	}
+
+	carrierID, err := s.resolveCarrierID(r.Context(), actor, r.PathValue("carrierID"))
+	if err != nil {
+		writeJSON(w, statusForError(err), errorResponse{Error: err.Error()})
+		return
+	}
+
+	onboarding, err := s.carrierOnboarder.GetOnboardingStatus(r.Context(), actor, carrierID)
+	if err != nil {
+		writeJSON(w, statusForError(err), errorResponse{Error: err.Error()})
+		return
+	}
+
+	fmcsa, err := s.evidenceService.LatestFMCSA(r.Context(), onboarding.Carrier.ID)
+	if err != nil {
+		writeJSON(w, statusForError(err), errorResponse{Error: err.Error()})
+		return
+	}
+
+	trustStatus, err := s.trustService.LatestTrust(r.Context(), onboarding.Carrier.ID)
+	if err != nil {
+		writeJSON(w, statusForError(err), errorResponse{Error: err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, intelligenceFromDomain(fmcsa, trustStatus))
 }
 
 func decodeJSON(r *http.Request, dst any) error {
@@ -480,6 +625,10 @@ func statusForError(err error) int {
 		return http.StatusConflict
 	case errors.Is(err, carrieridentity.ErrCarrierNotFound):
 		return http.StatusNotFound
+	case errors.Is(err, externalevidence.ErrNoAuthorityLink):
+		return http.StatusBadRequest
+	case errors.Is(err, externalevidence.ErrNoSnapshot), errors.Is(err, trust.ErrNoScorecard):
+		return http.StatusNotFound
 	default:
 		return http.StatusBadRequest
 	}
@@ -510,6 +659,47 @@ func (s *Server) authenticatedActor(r *http.Request) (identity.AuthenticatedAcco
 	}
 
 	return s.authenticator.Current(r.Context(), sessionToken)
+}
+
+func (s *Server) resolveCarrierID(ctx context.Context, actor identity.AuthenticatedAccount, carrierID string) (string, error) {
+	if carrierID != "current" {
+		return carrierID, nil
+	}
+
+	status, err := s.carrierOnboarder.GetCurrentOnboardingStatus(ctx, actor)
+	if err != nil {
+		return "", err
+	}
+
+	return status.Carrier.ID, nil
+}
+
+func (s *Server) syncCarrierIntelligence(ctx context.Context, actor identity.AuthenticatedAccount, onboarding carrieridentity.OnboardingStatus) (intelligenceResponse, error) {
+	fmcsa, err := s.evidenceService.RefreshFMCSA(ctx, onboarding)
+	if err != nil {
+		return intelligenceResponse{}, err
+	}
+
+	trustStatus, err := s.trustService.Evaluate(ctx, onboarding, fmcsa)
+	if err != nil {
+		return intelligenceResponse{}, err
+	}
+
+	return intelligenceFromDomain(fmcsa, trustStatus), nil
+}
+
+func (s *Server) tryEvaluateLatest(ctx context.Context, onboarding carrieridentity.OnboardingStatus) (intelligenceResponse, error) {
+	fmcsa, err := s.evidenceService.LatestFMCSA(ctx, onboarding.Carrier.ID)
+	if err != nil {
+		return intelligenceResponse{}, err
+	}
+
+	trustStatus, err := s.trustService.Evaluate(ctx, onboarding, fmcsa)
+	if err != nil {
+		return intelligenceResponse{}, err
+	}
+
+	return intelligenceFromDomain(fmcsa, trustStatus), nil
 }
 
 func onboardingStatusFromDomain(status carrieridentity.OnboardingStatus) onboardingStatusResponse {
@@ -583,6 +773,49 @@ func onboardingStatusFromDomain(status carrieridentity.OnboardingStatus) onboard
 			RequirementType: requirement.RequirementType,
 			Status:          requirement.Status,
 			SatisfiedAt:     requirement.SatisfiedAt,
+		})
+	}
+
+	return response
+}
+
+func intelligenceFromDomain(fmcsa externalevidence.FMCSAData, trustStatus trust.TrustStatus) intelligenceResponse {
+	response := intelligenceResponse{
+		FMCSA: fmcsaResponse{
+			Status:          fmcsa.Snapshot.Status,
+			FetchedAt:       fmcsa.Snapshot.FetchedAt,
+			SourceKey:       fmcsa.Snapshot.SourceKey,
+			LegalName:       fmcsa.Registration.LegalName,
+			AuthorityStatus: fmcsa.Registration.AuthorityStatus,
+			OperatingStatus: fmcsa.Registration.OperatingStatus,
+			OutOfService:    fmcsa.Registration.OutOfService,
+			SafetyRating:    fmcsa.Safety.SafetyRating,
+			CrashCount:      fmcsa.Safety.CrashCount,
+			InspectionCount: fmcsa.Safety.InspectionCount,
+			OOSRate:         fmcsa.Safety.OOSRate,
+		},
+		Scorecard: scorecardResponse{
+			ScoreValue:               trustStatus.Scorecard.ScoreValue,
+			ScoreBand:                trustStatus.Scorecard.ScoreBand,
+			EligibilityTier:          trustStatus.Scorecard.EligibilityTier,
+			VerificationCompleteness: trustStatus.Scorecard.VerificationCompleteness,
+			ReasonSummary:            trustStatus.Scorecard.ReasonSummary,
+			GeneratedAt:              trustStatus.Scorecard.GeneratedAt,
+		},
+	}
+
+	for _, grant := range trustStatus.AccessGrants {
+		response.Scorecard.AccessGrants = append(response.Scorecard.AccessGrants, accessGrantResponse{
+			GrantType:  grant.GrantType,
+			GrantValue: grant.GrantValue,
+		})
+	}
+
+	for _, signal := range trustStatus.FraudSignals {
+		response.Scorecard.FraudSignals = append(response.Scorecard.FraudSignals, fraudSignalResponse{
+			SignalType: signal.SignalType,
+			Severity:   signal.Severity,
+			Status:     signal.Status,
 		})
 	}
 

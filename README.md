@@ -1,6 +1,8 @@
 # shipper-to-carrier
 
 Milestone 1 provides the initial Go API, PostgreSQL migration bootstrap, session auth, and a lightweight dashboard shell for shipper and carrier actors.
+Milestone 2 adds carrier onboarding and verification workflow state.
+Milestone 3 adds FMCSA evidence snapshots, a basic carrier scorecard, fraud signals, and access grants.
 
 ## Foundation stack
 
@@ -37,3 +39,7 @@ Copy `.env.example` to your preferred environment file or export the variables d
 - `POST /api/v1/carriers/{carrierID}/authority`
 - `POST /api/v1/carriers/{carrierID}/insurance`
 - `GET /api/v1/carriers/{carrierID}/onboarding-status`
+- `POST /api/v1/carriers/{carrierID}/fmcsa-refresh`
+- `GET /api/v1/carriers/{carrierID}/intelligence`
+
+The current FMCSA integration uses a deterministic mock provider so local development can exercise scorecard and fraud behavior without external credentials.
