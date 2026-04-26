@@ -7,9 +7,11 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/DavitHakobyan/shipper-to-carrier/internal/carrieridentity"
 	platformauth "github.com/DavitHakobyan/shipper-to-carrier/internal/platform/auth"
 	"github.com/DavitHakobyan/shipper-to-carrier/internal/platform/config"
 	"github.com/DavitHakobyan/shipper-to-carrier/internal/platform/web"
+	"github.com/DavitHakobyan/shipper-to-carrier/internal/verification"
 
 	"github.com/DavitHakobyan/shipper-to-carrier/internal/identity"
 )
@@ -21,9 +23,19 @@ type Authenticator interface {
 	Logout(rctx context.Context, sessionToken string) error
 }
 
+type CarrierOnboarder interface {
+	CreateCarrier(ctx context.Context, actor identity.AuthenticatedAccount, input carrieridentity.CreateCarrierInput) (carrieridentity.OnboardingStatus, error)
+	AddOwner(ctx context.Context, actor identity.AuthenticatedAccount, carrierID string, input carrieridentity.AddOwnerInput) (carrieridentity.OnboardingStatus, error)
+	UpsertAuthority(ctx context.Context, actor identity.AuthenticatedAccount, carrierID string, input carrieridentity.UpsertAuthorityInput) (carrieridentity.OnboardingStatus, error)
+	AddInsurance(ctx context.Context, actor identity.AuthenticatedAccount, carrierID string, input carrieridentity.AddInsuranceInput) (carrieridentity.OnboardingStatus, error)
+	GetOnboardingStatus(ctx context.Context, actor identity.AuthenticatedAccount, carrierID string) (carrieridentity.OnboardingStatus, error)
+	GetCurrentOnboardingStatus(ctx context.Context, actor identity.AuthenticatedAccount) (carrieridentity.OnboardingStatus, error)
+}
+
 type Server struct {
-	config        config.Config
-	authenticator Authenticator
+	config           config.Config
+	authenticator    Authenticator
+	carrierOnboarder CarrierOnboarder
 }
 
 type configResponse struct {
@@ -59,15 +71,134 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
-func NewServer(cfg config.Config, authenticator Authenticator) (http.Handler, error) {
+type carrierAddressRequest struct {
+	AddressType string `json:"addressType"`
+	Line1       string `json:"line1"`
+	Line2       string `json:"line2"`
+	City        string `json:"city"`
+	State       string `json:"state"`
+	PostalCode  string `json:"postalCode"`
+	Country     string `json:"country"`
+}
+
+type createCarrierRequest struct {
+	LegalName          string                `json:"legalName"`
+	DoingBusinessAs    string                `json:"doingBusinessAs"`
+	ContactPhone       string                `json:"contactPhone"`
+	FleetSizeDeclared  int                   `json:"fleetSizeDeclared"`
+	OperatingRegions   []string              `json:"operatingRegions"`
+	PreferredLoadTypes []string              `json:"preferredLoadTypes"`
+	Address            carrierAddressRequest `json:"address"`
+}
+
+type addOwnerRequest struct {
+	FullName         string `json:"fullName"`
+	Phone            string `json:"phone"`
+	Email            string `json:"email"`
+	OwnershipRole    string `json:"ownershipRole"`
+	IsPrimaryContact bool   `json:"isPrimaryContact"`
+}
+
+type upsertAuthorityRequest struct {
+	DOTNumber     string `json:"dotNumber"`
+	MCNumber      string `json:"mcNumber"`
+	USDOTStatus   string `json:"usdotStatus"`
+	AuthorityType string `json:"authorityType"`
+}
+
+type addInsuranceRequest struct {
+	ProviderName       string    `json:"providerName"`
+	PolicyNumber       string    `json:"policyNumber"`
+	CoverageType       string    `json:"coverageType"`
+	EffectiveAt        time.Time `json:"effectiveAt"`
+	ExpiresAt          time.Time `json:"expiresAt"`
+	VerificationStatus string    `json:"verificationStatus"`
+}
+
+type onboardingStatusResponse struct {
+	Carrier             carrierResponse                   `json:"carrier"`
+	Profile             carrierProfileResponse            `json:"profile"`
+	Addresses           []carrierAddressResponse          `json:"addresses"`
+	Owners              []ownerResponse                   `json:"owners"`
+	AuthorityLink       *authorityResponse                `json:"authorityLink,omitempty"`
+	InsurancePolicies   []insuranceResponse               `json:"insurancePolicies"`
+	VerificationCase    verificationCaseResponse          `json:"verificationCase"`
+	Requirements        []verificationRequirementResponse `json:"requirements"`
+	MissingRequirements []verification.RequirementType    `json:"missingRequirements"`
+}
+
+type carrierResponse struct {
+	ID              string                          `json:"id"`
+	LegalName       string                          `json:"legalName"`
+	DoingBusinessAs string                          `json:"doingBusinessAs"`
+	Status          carrieridentity.CarrierStatus   `json:"status"`
+	OnboardingStage carrieridentity.OnboardingStage `json:"onboardingStage"`
+}
+
+type carrierProfileResponse struct {
+	ContactPhone       string   `json:"contactPhone"`
+	ContactEmail       string   `json:"contactEmail"`
+	FleetSizeDeclared  int      `json:"fleetSizeDeclared"`
+	OperatingRegions   []string `json:"operatingRegions"`
+	PreferredLoadTypes []string `json:"preferredLoadTypes"`
+}
+
+type carrierAddressResponse struct {
+	AddressType string `json:"addressType"`
+	Line1       string `json:"line1"`
+	Line2       string `json:"line2"`
+	City        string `json:"city"`
+	State       string `json:"state"`
+	PostalCode  string `json:"postalCode"`
+	Country     string `json:"country"`
+}
+
+type ownerResponse struct {
+	FullName         string `json:"fullName"`
+	Phone            string `json:"phone"`
+	Email            string `json:"email"`
+	OwnershipRole    string `json:"ownershipRole"`
+	IsPrimaryContact bool   `json:"isPrimaryContact"`
+}
+
+type authorityResponse struct {
+	DOTNumber     string `json:"dotNumber"`
+	MCNumber      string `json:"mcNumber"`
+	USDOTStatus   string `json:"usdotStatus"`
+	AuthorityType string `json:"authorityType"`
+}
+
+type insuranceResponse struct {
+	ProviderName       string    `json:"providerName"`
+	CoverageType       string    `json:"coverageType"`
+	EffectiveAt        time.Time `json:"effectiveAt"`
+	ExpiresAt          time.Time `json:"expiresAt"`
+	VerificationStatus string    `json:"verificationStatus"`
+}
+
+type verificationCaseResponse struct {
+	ID       string                  `json:"id"`
+	CaseType verification.CaseType   `json:"caseType"`
+	Status   verification.CaseStatus `json:"status"`
+	OpenedAt time.Time               `json:"openedAt"`
+}
+
+type verificationRequirementResponse struct {
+	RequirementType verification.RequirementType   `json:"requirementType"`
+	Status          verification.RequirementStatus `json:"status"`
+	SatisfiedAt     *time.Time                     `json:"satisfiedAt,omitempty"`
+}
+
+func NewServer(cfg config.Config, authenticator Authenticator, carrierOnboarder CarrierOnboarder) (http.Handler, error) {
 	assetHandler, err := web.NewHandler()
 	if err != nil {
 		return nil, err
 	}
 
 	server := &Server{
-		config:        cfg,
-		authenticator: authenticator,
+		config:           cfg,
+		authenticator:    authenticator,
+		carrierOnboarder: carrierOnboarder,
 	}
 
 	mux := http.NewServeMux()
@@ -77,6 +208,11 @@ func NewServer(cfg config.Config, authenticator Authenticator) (http.Handler, er
 	mux.HandleFunc("POST /api/v1/sessions", server.handleLogin)
 	mux.HandleFunc("POST /api/v1/sessions/logout", server.handleLogout)
 	mux.HandleFunc("GET /api/v1/me", server.handleCurrent)
+	mux.HandleFunc("POST /api/v1/carriers", server.handleCreateCarrier)
+	mux.HandleFunc("POST /api/v1/carriers/{carrierID}/owners", server.handleAddOwner)
+	mux.HandleFunc("POST /api/v1/carriers/{carrierID}/authority", server.handleUpsertAuthority)
+	mux.HandleFunc("POST /api/v1/carriers/{carrierID}/insurance", server.handleAddInsurance)
+	mux.HandleFunc("GET /api/v1/carriers/{carrierID}/onboarding-status", server.handleOnboardingStatus)
 	mux.Handle("/", assetHandler)
 
 	return mux, nil
@@ -169,6 +305,150 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *Server) handleCreateCarrier(w http.ResponseWriter, r *http.Request) {
+	var input createCarrierRequest
+	if err := decodeJSON(r, &input); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
+		return
+	}
+
+	actor, err := s.authenticatedActor(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, errorResponse{Error: err.Error()})
+		return
+	}
+
+	status, err := s.carrierOnboarder.CreateCarrier(r.Context(), actor, carrieridentity.CreateCarrierInput{
+		LegalName:          input.LegalName,
+		DoingBusinessAs:    input.DoingBusinessAs,
+		ContactPhone:       input.ContactPhone,
+		FleetSizeDeclared:  input.FleetSizeDeclared,
+		OperatingRegions:   input.OperatingRegions,
+		PreferredLoadTypes: input.PreferredLoadTypes,
+		Address: carrieridentity.CarrierAddressInput{
+			AddressType: input.Address.AddressType,
+			Line1:       input.Address.Line1,
+			Line2:       input.Address.Line2,
+			City:        input.Address.City,
+			State:       input.Address.State,
+			PostalCode:  input.Address.PostalCode,
+			Country:     input.Address.Country,
+		},
+	})
+	if err != nil {
+		writeJSON(w, statusForError(err), errorResponse{Error: err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, onboardingStatusFromDomain(status))
+}
+
+func (s *Server) handleAddOwner(w http.ResponseWriter, r *http.Request) {
+	var input addOwnerRequest
+	if err := decodeJSON(r, &input); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
+		return
+	}
+
+	actor, err := s.authenticatedActor(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, errorResponse{Error: err.Error()})
+		return
+	}
+
+	status, err := s.carrierOnboarder.AddOwner(r.Context(), actor, r.PathValue("carrierID"), carrieridentity.AddOwnerInput{
+		FullName:         input.FullName,
+		Phone:            input.Phone,
+		Email:            input.Email,
+		OwnershipRole:    input.OwnershipRole,
+		IsPrimaryContact: input.IsPrimaryContact,
+	})
+	if err != nil {
+		writeJSON(w, statusForError(err), errorResponse{Error: err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, onboardingStatusFromDomain(status))
+}
+
+func (s *Server) handleUpsertAuthority(w http.ResponseWriter, r *http.Request) {
+	var input upsertAuthorityRequest
+	if err := decodeJSON(r, &input); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
+		return
+	}
+
+	actor, err := s.authenticatedActor(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, errorResponse{Error: err.Error()})
+		return
+	}
+
+	status, err := s.carrierOnboarder.UpsertAuthority(r.Context(), actor, r.PathValue("carrierID"), carrieridentity.UpsertAuthorityInput{
+		DOTNumber:     input.DOTNumber,
+		MCNumber:      input.MCNumber,
+		USDOTStatus:   input.USDOTStatus,
+		AuthorityType: input.AuthorityType,
+	})
+	if err != nil {
+		writeJSON(w, statusForError(err), errorResponse{Error: err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, onboardingStatusFromDomain(status))
+}
+
+func (s *Server) handleAddInsurance(w http.ResponseWriter, r *http.Request) {
+	var input addInsuranceRequest
+	if err := decodeJSON(r, &input); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
+		return
+	}
+
+	actor, err := s.authenticatedActor(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, errorResponse{Error: err.Error()})
+		return
+	}
+
+	status, err := s.carrierOnboarder.AddInsurance(r.Context(), actor, r.PathValue("carrierID"), carrieridentity.AddInsuranceInput{
+		ProviderName:       input.ProviderName,
+		PolicyNumber:       input.PolicyNumber,
+		CoverageType:       input.CoverageType,
+		EffectiveAt:        input.EffectiveAt,
+		ExpiresAt:          input.ExpiresAt,
+		VerificationStatus: input.VerificationStatus,
+	})
+	if err != nil {
+		writeJSON(w, statusForError(err), errorResponse{Error: err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, onboardingStatusFromDomain(status))
+}
+
+func (s *Server) handleOnboardingStatus(w http.ResponseWriter, r *http.Request) {
+	actor, err := s.authenticatedActor(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, errorResponse{Error: err.Error()})
+		return
+	}
+
+	carrierID := r.PathValue("carrierID")
+	var status carrieridentity.OnboardingStatus
+	if carrierID == "current" {
+		status, err = s.carrierOnboarder.GetCurrentOnboardingStatus(r.Context(), actor)
+	} else {
+		status, err = s.carrierOnboarder.GetOnboardingStatus(r.Context(), actor, carrierID)
+	}
+	if err != nil {
+		writeJSON(w, statusForError(err), errorResponse{Error: err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, onboardingStatusFromDomain(status))
+}
+
 func decodeJSON(r *http.Request, dst any) error {
 	defer r.Body.Close()
 
@@ -194,6 +474,12 @@ func statusForError(err error) int {
 		return http.StatusConflict
 	case errors.Is(err, identity.ErrInvalidCredentials), errors.Is(err, identity.ErrUnauthorized):
 		return http.StatusUnauthorized
+	case errors.Is(err, carrieridentity.ErrForbidden):
+		return http.StatusForbidden
+	case errors.Is(err, carrieridentity.ErrCarrierExists):
+		return http.StatusConflict
+	case errors.Is(err, carrieridentity.ErrCarrierNotFound):
+		return http.StatusNotFound
 	default:
 		return http.StatusBadRequest
 	}
@@ -215,4 +501,90 @@ func accountFromAuthenticated(account identity.AuthenticatedAccount) accountResp
 		DisplayName: account.DisplayName,
 		Role:        account.Role,
 	}
+}
+
+func (s *Server) authenticatedActor(r *http.Request) (identity.AuthenticatedAccount, error) {
+	sessionToken, err := sessionTokenFromRequest(r, s.config.SessionCookieName)
+	if err != nil {
+		return identity.AuthenticatedAccount{}, err
+	}
+
+	return s.authenticator.Current(r.Context(), sessionToken)
+}
+
+func onboardingStatusFromDomain(status carrieridentity.OnboardingStatus) onboardingStatusResponse {
+	response := onboardingStatusResponse{
+		Carrier: carrierResponse{
+			ID:              status.Carrier.ID,
+			LegalName:       status.Carrier.LegalName,
+			DoingBusinessAs: status.Carrier.DoingBusinessAs,
+			Status:          status.Carrier.Status,
+			OnboardingStage: status.Carrier.OnboardingStage,
+		},
+		Profile: carrierProfileResponse{
+			ContactPhone:       status.Profile.ContactPhone,
+			ContactEmail:       status.Profile.ContactEmail,
+			FleetSizeDeclared:  status.Profile.FleetSizeDeclared,
+			OperatingRegions:   status.Profile.OperatingRegions,
+			PreferredLoadTypes: status.Profile.PreferredLoadTypes,
+		},
+		VerificationCase: verificationCaseResponse{
+			ID:       status.VerificationCase.ID,
+			CaseType: status.VerificationCase.CaseType,
+			Status:   status.VerificationCase.Status,
+			OpenedAt: status.VerificationCase.OpenedAt,
+		},
+		MissingRequirements: status.MissingRequirements,
+	}
+
+	for _, address := range status.Addresses {
+		response.Addresses = append(response.Addresses, carrierAddressResponse{
+			AddressType: address.AddressType,
+			Line1:       address.Line1,
+			Line2:       address.Line2,
+			City:        address.City,
+			State:       address.State,
+			PostalCode:  address.PostalCode,
+			Country:     address.Country,
+		})
+	}
+
+	for _, owner := range status.Owners {
+		response.Owners = append(response.Owners, ownerResponse{
+			FullName:         owner.FullName,
+			Phone:            owner.Phone,
+			Email:            owner.Email,
+			OwnershipRole:    owner.OwnershipRole,
+			IsPrimaryContact: owner.IsPrimaryContact,
+		})
+	}
+
+	if status.AuthorityLink != nil {
+		response.AuthorityLink = &authorityResponse{
+			DOTNumber:     status.AuthorityLink.DOTNumber,
+			MCNumber:      status.AuthorityLink.MCNumber,
+			USDOTStatus:   status.AuthorityLink.USDOTStatus,
+			AuthorityType: status.AuthorityLink.AuthorityType,
+		}
+	}
+
+	for _, policy := range status.InsurancePolicies {
+		response.InsurancePolicies = append(response.InsurancePolicies, insuranceResponse{
+			ProviderName:       policy.ProviderName,
+			CoverageType:       policy.CoverageType,
+			EffectiveAt:        policy.EffectiveAt,
+			ExpiresAt:          policy.ExpiresAt,
+			VerificationStatus: policy.VerificationStatus,
+		})
+	}
+
+	for _, requirement := range status.Requirements {
+		response.Requirements = append(response.Requirements, verificationRequirementResponse{
+			RequirementType: requirement.RequirementType,
+			Status:          requirement.Status,
+			SatisfiedAt:     requirement.SatisfiedAt,
+		})
+	}
+
+	return response
 }

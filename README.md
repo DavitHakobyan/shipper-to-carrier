@@ -32,3 +32,8 @@ Copy `.env.example` to your preferred environment file or export the variables d
 - `POST /api/v1/sessions`
 - `GET /api/v1/me`
 - `POST /api/v1/sessions/logout`
+- `POST /api/v1/carriers`
+- `POST /api/v1/carriers/{carrierID}/owners`
+- `POST /api/v1/carriers/{carrierID}/authority`
+- `POST /api/v1/carriers/{carrierID}/insurance`
+- `GET /api/v1/carriers/{carrierID}/onboarding-status`

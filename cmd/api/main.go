@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/DavitHakobyan/shipper-to-carrier/internal/app"
+	"github.com/DavitHakobyan/shipper-to-carrier/internal/carrieridentity"
 	"github.com/DavitHakobyan/shipper-to-carrier/internal/identity"
 	"github.com/DavitHakobyan/shipper-to-carrier/internal/platform/config"
 	"github.com/DavitHakobyan/shipper-to-carrier/internal/platform/store/postgres"
@@ -36,8 +37,10 @@ func main() {
 
 	repo := identity.NewPostgresRepository(pool)
 	authenticator := identity.NewService(repo, cfg.SessionTTL)
+	carrierRepo := carrieridentity.NewPostgresRepository(pool)
+	carrierService := carrieridentity.NewService(carrierRepo)
 
-	handler, err := app.NewServer(cfg, authenticator)
+	handler, err := app.NewServer(cfg, authenticator, carrierService)
 	if err != nil {
 		log.Fatalf("build server: %v", err)
 	}
